@@ -109,9 +109,7 @@ t_stance = 0.1
 foot_pose = get_footstep_pose(v_cmd,w_cmd,x0,shoulder,t_stance)
 print(foot_pose)
 
-
-assert False
 env = Env(True, "config.yaml")
 for i in range(1000):
     env.step()
-    time.sleep(0.001)
+    time.sleep(1/1000.)

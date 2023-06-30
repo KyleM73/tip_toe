@@ -1,6 +1,8 @@
 import datetime
 import numpy as np
 import os
+import osqp
+import pinocchio as pin
 import pybullet as p
 import pybullet_data
 from pybullet_utils import bullet_client
@@ -27,55 +29,169 @@ class Env:
             self.client = bullet_client.BulletClient(connection_mode=p.GUI)
             self.client.configureDebugVisualizer(p.COV_ENABLE_GUI,0)
 
-
-        ## initiate simulation
+        ## initialize simulation
+        self.g = -9.8
         self.client.resetSimulation()
         self.client.setTimeStep(1./self.cfg["PHYSICS_HZ"])
-        self.client.setGravity(0, 0, -9.8)
+        self.client.setGravity(0, 0, self.g)
         self.client.setPhysicsEngineParameter(enableFileCaching=0)
 
         ## setup ground
-        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        self.client.setAdditionalSearchPath(pybullet_data.getDataPath())
         self.ground = self.client.loadURDF("plane.urdf")
 
         ## setup robot
-        self.robot = p.loadURDF("robots/go1.urdf", [0, 0, 0.5], [0, 0, 0, 1], useFixedBase=False)
+        self.robot = self.client.loadURDF(self.cfg["ROBOT_URDF"], [0, 0, 0.5], [0, 0, 0, 1], useFixedBase=False)
+
+        ## let robot settle
+        for _ in range(self.cfg["PHYSICS_HZ"]):
+            self.client.stepSimulation()
+
+        ## initialize controller
+        self.controller = Controller(self.cfg["ROBOT_URDF"])
+
+        self.nJoints = p.getNumJoints(self.robot)
+        self.joint_name2idx = {}
+        self.active_joint_name2idx = {}
+        self.link_name2idx = {}
+        for i in range(self.nJoints):
+          jointInfo = p.getJointInfo(self.robot, i)
+          self.joint_name2idx[jointInfo[1].decode('UTF-8')] = jointInfo[0]
+          self.link_name2idx[jointInfo[12].decode('UTF-8')] = jointInfo[0]
+          if jointInfo[2] != p.JOINT_FIXED:
+            self.active_joint_name2idx[jointInfo[1].decode('UTF-8')] = jointInfo[0]
+        self.hip_name2idx = {k:v for k,v in self.link_name2idx.items() if k[-3:] == "hip"}
+        self.hips = [k for k in self.hip_name2idx.keys()]
+        self.feet = [k for k in self.link_name2idx.keys() if "foot" in k]
 
     def step(self):
-        p.stepSimulation()
+        x = self.get_obs()
+        t_stance = np.array([[0.5,0.5,0.5,0.5]]).T
+        links = self.client.getLinkStates(self.robot, [self.hip_name2idx[hip_name] for hip_name in self.hips])
+        hip_poses = np.array([l[0] for l in links])
+        footstep = self.controller.get_footstep_pose(x, hip_poses, t_stance)
+        print(footstep)
+        assert False
+        self.client.stepSimulation()
 
-class MPC:
-    def __init__(self):
+    def get_obs(self):
+        pose, oriq = self.client.getBasePositionAndOrientation(self.robot)
+        ori = self.client.getEulerFromQuaternion(oriq)
+        vel, avel = self.client.getBaseVelocity(self.robot)
+        x = list(ori + pose + avel + vel)
+        x.append(self.g)
+        x[6:9] = self.controller.rot(x[2]) @ x[6:9] #convert to body frame
+        return np.array(x).reshape(-1,1)
+
+class Controller:
+    def __init__(self, robot_urdf):
+        self.robot = pin.buildModelFromUrdf(robot_urdf)
+        self.data = self.robot.createData()
+
+        self.dt = 0.5
+        self.k = 10
+        self.m = 12
+        self.mu = 0.6
+        self.body_inertia = np.array([
+            [0.13,0,0],
+            [0,0.40,0],
+            [0,0,0.45]
+            ])
+        self.indicator = np.array([[0],[0],[1]])
+
+    def act(self, x, hips, yaw_cmd=0, vx_cmd=1, vy_cmd=0, t_stance=0.5):
+        x = x.reshape(-1,1)
+        ori = x[:3]
+        pose = x[3:6]
+        w = x[6:9]
+        vel = x[9:12]
+        g = x[12]
+        x_ref = self.get_ref_com(
+            ori[2,0], pose[0,0], pose[1,0], pose[2,0],
+            yaw_cmd, vx_cmd, vy_cmd, self.dt, self.k
+            )
+        footstep_des = self.get_footstep_pose(x, hips, t_stance)
+        rot = self.rot(ori[2,0]).T
+        A = np.block([
+            [np.eye(3), np.zeros((3,3)), rot*self.dt/self.k, np.zeros((3,3)), np.zeros((3,1))],
+            [np.zeros((3,3)), np.eye(3), np.zeros((3,3)), np.eye(3)*self.dt/self.k, np.zeros((3,1))],
+            [np.zeros((3,3)), np.zeros((3,3)), np.eye(3), np.zeros((3,3)), np.zeros((3,1))],
+            [np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3)), np.eye(3), self.indicator*self.dt/self.k], #np.array([[0],[0],[1]])
+            [np.zeros((1,3)), np.zeros((1,3)), np.zeros((1,3)), np.zeros((1,3)), np.ones(1)]
+            ])
+        gI_inv = np.linalg.inv(rot@self.body_inertia@rot.T)
+        B = np.block([
+            [np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3))],
+            [np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3))],
+            []
+            ])
+
+
+    def get_ref_com(self, yaw, x, y, z, yaw_rate_cmd, vx_cmd, vy_cmd, dt, k):
+        A = np.block([
+            [np.eye(3), np.zeros((3,3)), np.array([[0,0,0],[0,0,0],[0,0,dt/k]]), np.zeros((3,3)), np.zeros((3,1))],
+            [np.zeros((3,3)), np.eye(3), np.zeros((3,3)), np.eye(3)*dt/k, np.zeros((3,1))],
+            [np.zeros((3,3)), np.zeros((3,3)), np.eye(3), np.zeros((3,3)), np.zeros((3,1))],
+            [np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3)), np.eye(3), np.zeros((3,1))], #np.array([[0],[0],[1]])
+            [np.zeros((1,3)), np.zeros((1,3)), np.zeros((1,3)), np.zeros((1,3)), np.ones(1)]
+            ])
+        A_stack = np.vstack([np.linalg.matrix_power(A,i) for i in range(k+1)])
+        x0 = np.array([[0,0,yaw,x,y,z,0,0,yaw_rate_cmd,vx_cmd,vy_cmd,0,-9.8]]).T
+        return A_stack @ x0
+
+    def MPC(self):
         pass
 
-def get_skew_sym_mat(v):
-    assert v.size == 3
-    v = np.ravel(v)
-    return np.array([
-        [0,-v[2],v[1]],
-        [v[2],0,-v[0]],
-        [-v[1],v[0],0]
-        ])
 
-def rot(yaw):
-    return np.array([
-        [np.cos(yaw), np.sin(yaw), 0],
-        [-np.sin(yaw), np.cos(yaw), 0],
-        [0, 0, 1]
-        ])
+    def get_skew_sym_mat(self, v):
+        assert v.size == 3
+        v = np.ravel(v)
+        return np.array([
+            [0,-v[2],v[1]],
+            [v[2],0,-v[0]],
+            [-v[1],v[0],0]
+            ])
 
-def get_ref_com(yaw, x, y, z, yaw_rate_cmd, vx_cmd, vy_cmd, dt, k):
-    A = np.block([
-        [np.eye(3), np.zeros((3,3)), np.array([[0,0,0],[0,0,0],[0,0,dt/k]]), np.zeros((3,3)), np.zeros((3,1))],
-        [np.zeros((3,3)), np.eye(3), np.zeros((3,3)), np.eye(3)*dt/k, np.zeros((3,1))],
-        [np.zeros((3,3)), np.zeros((3,3)), np.eye(3), np.zeros((3,3)), np.zeros((3,1))],
-        [np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3)), np.eye(3), np.zeros((3,1))], #np.array([[0],[0],[1]])
-        [np.zeros((1,3)), np.zeros((1,3)), np.zeros((1,3)), np.zeros((1,3)), np.ones(1)]
-        ])
-    A_stack = np.vstack([np.linalg.matrix_power(A,i) for i in range(k+1)])
-    x0 = np.array([[0,0,yaw,x,y,z,0,0,yaw_rate_cmd,vx_cmd,vy_cmd,0,-9.8]]).T
-    return A_stack @ x0
+    def rot(self, yaw):
+        return np.array([
+            [np.cos(yaw), -np.sin(yaw), 0],
+            [np.sin(yaw), np.cos(yaw), 0],
+            [0, 0, 1]
+            ])
 
+    def get_footstep_pose(self, x, hips, t_stance):
+        # returns (4,3) array of footstep locations
+        x = x.reshape(-1,1)
+        ori = x[:3]
+        pose = x[3:6]
+        w = x[6:9]
+        vel = x[9:12]
+        g = x[12]
+
+        p_ref = pose + self.rot(ori[2,0]) @ hips.T
+        p_des = p_ref.T + vel.T*t_stance/2
+        p_des[:,2] = 0
+        return p_des
+
+    def get_footstep_pose_WBIC(self, v_cmd, w_cmd, x, hips, t_stance, k=0.03):
+        # returns (4,3) array of footstep locations
+        x = x.reshape(-1,1)
+        ori = x[:3]
+        pose = x[3:6]
+        w = x[6:9]
+        vel = x[9:12]
+        g = x[12]
+
+        p_hip = pose + self.rot(ori[2,0]) @ hips.T
+        p_sym = vel.T*t_stance/2 + k*(vel.T - v_cmd)
+        p_centrifugal = np.sqrt(np.abs(pose[2]/g))/2 * np.cross(vel.T,w_cmd)
+
+        loc = p_hip.T + p_sym + p_centrifugal
+        loc[:,2] = 0
+        return loc
+
+
+"""
 yaw = 0
 x,y,z = 1,0.5,0.5
 yaw_cmd = 0.1
@@ -84,22 +200,6 @@ vx_cmd,vy_cmd = 1,0
 traj = get_ref_com(yaw,x,y,z,yaw_cmd,vx_cmd,vy_cmd,1,1)
 x0 = traj[:13]
 
-def get_footstep_pose(v_cmd,w_cmd,x,shoulder,t_stance,k=0.03):
-    # returns (4,3) array of footstep locations
-    x = x.reshape(-1,1)
-    ori = x[:3]
-    pose = x[3:6]
-    w = x[6:9]
-    vel = x[9:12]
-    g = x[12]
-
-    p_shoulder = pose + rot(ori[2,0]) @ shoulder.T
-    p_sym = t_stance/2 * vel.T + k*(vel.T - v_cmd)
-    p_centrifugal = np.sqrt(np.abs(pose[2]/g))/2 * np.cross(vel.T,w_cmd)
-
-    loc = p_shoulder.T + p_sym + p_centrifugal
-    loc[:,2] = 0
-    return loc
 
 v_cmd = np.array([[vx_cmd,vy_cmd,0]])
 w_cmd = np.array([[0,0,yaw_cmd]])
@@ -108,6 +208,7 @@ t_stance = 0.1
 
 foot_pose = get_footstep_pose(v_cmd,w_cmd,x0,shoulder,t_stance)
 print(foot_pose)
+"""
 
 env = Env(True, "config.yaml")
 for i in range(1000):

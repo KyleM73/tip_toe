@@ -2,6 +2,7 @@ import datetime
 import numpy as np
 import os
 import osqp
+#import osqp_c
 import pinocchio as pin
 import pybullet as p
 import pybullet_data
@@ -47,9 +48,6 @@ class Env:
         for _ in range(self.cfg["PHYSICS_HZ"]):
             self.client.stepSimulation()
 
-        ## initialize controller
-        self.controller = Controller(self.cfg["ROBOT_URDF"])
-
         self.nJoints = p.getNumJoints(self.robot)
         self.joint_name2idx = {}
         self.active_joint_name2idx = {}
@@ -63,6 +61,12 @@ class Env:
         self.hip_name2idx = {k:v for k,v in self.link_name2idx.items() if k[-3:] == "hip"}
         self.hips = [k for k in self.hip_name2idx.keys()]
         self.feet = [k for k in self.link_name2idx.keys() if "foot" in k]
+        self.active_joint_idx = [v for v in self.active_joint_name2idx.values()]
+
+        ## initialize controller
+        self.controller = Controller(self.cfg["ROBOT_URDF"])
+        self.controller.update_kinematics(*self.get_q())
+        self.controller.set_feet_links(self.feet)
 
     def step(self):
         x = self.get_obs()
@@ -70,9 +74,16 @@ class Env:
         links = self.client.getLinkStates(self.robot, [self.hip_name2idx[hip_name] for hip_name in self.hips])
         hip_poses = np.array([l[0] for l in links])
         footstep = self.controller.get_footstep_pose(x, hip_poses, t_stance)
-        self.controller.act(x, hip_poses)
-        assert False
-        self.client.stepSimulation()
+        u = self.controller.step_MPC(x, hip_poses)
+        for _ in range(self.cfg["PHYSICS_HZ"]//self.cfg["MPC_HZ"]):
+            self.controller.update_kinematics(*self.get_q())
+            torques = self.controller.step_WBC(u)
+            torque = np.concatenate(torques)
+            print(torque)
+            self.client.setJointMotorControlArray(self.robot,
+                self.active_joint_idx, p.TORQUE_CONTROL,
+                forces=torque)
+            self.client.stepSimulation()
 
     def get_obs(self):
         pose, oriq = self.client.getBasePositionAndOrientation(self.robot)
@@ -83,10 +94,18 @@ class Env:
         x[6:9] = self.controller.rot(x[2]) @ x[6:9] #convert to body frame
         return np.array(x).reshape(-1,1)
 
+    def get_q(self):
+        configuration = self.client.getJointStates(self.robot, self.active_joint_idx)
+        q = [c[0] for c in configuration]
+        q_dot = [c[1] for c in configuration]
+        return np.array(q), np.array(q_dot)
+
 class Controller:
     def __init__(self, robot_urdf):
         self.robot = pin.buildModelFromUrdf(robot_urdf)
         self.data = self.robot.createData()
+        #for name, function in self.robot.__class__.__dict__.items():
+        #    print(' **** %s: %s' % (name, function.__doc__))
         self.n = 4
         self.ns = 13
         self.dt = 0.5
@@ -99,16 +118,22 @@ class Controller:
             [0,0.40,0],
             [0,0,0.45]
             ])
-        self.indicator = np.array([[0],[0],[1]])
+        self.indicator = np.array([[0],[0],[1]]) #gravity only acts in z direction
         self.z_weight = 50
         self.force_weight = 1e-6
         self.fmin = 0
         self.fmax = 200
         self.qp_problem = None
-        self.Uz_last = 100 * np.ones((self.n*self.k))
+        self.Uz_last = 100 * np.ones((self.n*self.k,))
         self.c = np.array([[1/self.mu,0,0],[0,1/self.mu,0],[0,0,1]])
+        self.foot_jacobian_selector = [1, 0, 3, 2] #picks which submatrix of jacobian goes with each foot
 
-    def act(self, x, hips, mpc_update=True, yaw_cmd=0, vx_cmd=1, vy_cmd=0):
+    def update_kinematics(self, q, q_dot):
+        self.q, self.q_dot = q, q_dot
+        pin.forwardKinematics(self.robot, self.data, q, q_dot)
+        pin.updateFramePlacements(self.robot, self.data)
+
+    def step_MPC(self, x, hips, mpc_update=True, yaw_cmd=0, vx_cmd=0, vy_cmd=0):
         x = x.reshape(-1,1)
         ori = x[:3]
         pose = x[3:6]
@@ -121,23 +146,28 @@ class Controller:
             )
         t_stance = self.get_stance_time()
         r = self.get_footstep_pose(x, hips, t_stance) #desired footstep location
-        rot = self.rot(ori[2,0]).T
+        self.R = self.rot(ori[2,0]).T
         A = np.block([
-            [np.eye(3), np.zeros((3,3)), rot*self.delta_t, np.zeros((3,3)), np.zeros((3,1))],
+            [np.eye(3), np.zeros((3,3)), self.R*self.delta_t, np.zeros((3,3)), np.zeros((3,1))],
             [np.zeros((3,3)), np.eye(3), np.zeros((3,3)), np.eye(3)*self.delta_t, np.zeros((3,1))],
             [np.zeros((3,3)), np.zeros((3,3)), np.eye(3), np.zeros((3,3)), np.zeros((3,1))],
             [np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3)), np.eye(3), self.indicator*self.delta_t], #np.array([[0],[0],[1]])
             [np.zeros((1,3)), np.zeros((1,3)), np.zeros((1,3)), np.zeros((1,3)), np.ones(1)]
             ])
-        gI_inv = np.linalg.inv(rot@self.body_inertia@rot.T)
+        gI_inv = np.linalg.inv(self.R@self.body_inertia@self.R.T)
         B = np.block([
             [np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3))],
             [np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3))],
             [gI_inv@self.get_skew_sym_mat(r[i])*self.delta_t for i in range(self.n)],
-            [np.eye(3)*self.delta_t for _ in range(self.n)],
+            [np.eye(3)*self.delta_t/self.m for _ in range(self.n)],
             [np.zeros((1,3)) for _ in range(self.n)]
             ])
-        self.MPC(A, B, x, x_ref)
+        U = self.MPC(A, B, x, x_ref)
+        u = U[0,...]
+        return u
+
+    def step_WBC(self, u):
+        return self.WBC_ground_force_control(u)
 
     def get_stance_time(self):
         return np.array([[0.5,0.5,0.5,0.5]]).T
@@ -180,10 +210,12 @@ class Controller:
         H = sp.sparse.csc_matrix(H)
         g = 2*Bqp.T @ L @ (Aqp @ x0 - x_ref)
 
-        c_l = [np.array([-self.Uz_last[i], -self.Uz_last[i], self.fmin]) for i in range(self.n*self.k)]
+        Uz_last_low = np.minimum(-self.Uz_last, 0)
+        c_l = [np.array([Uz_last_low[i], Uz_last_low[i], self.fmin]) for i in range(self.n*self.k)]
         c_low = np.block(c_l).reshape(-1, 1)
         
-        c_h = [np.array([self.Uz_last[i], self.Uz_last[i], self.fmax]) for i in range(self.n*self.k)]
+        Uz_last_high = np.maximum(self.Uz_last, 0)
+        c_h = [np.array([Uz_last_high[i], Uz_last_high[i], self.fmax]) for i in range(self.n*self.k)]
         c_high = np.block(c_h).reshape(-1, 1)
 
         C = sp.linalg.block_diag(*[self.c for _ in range(self.n*self.k)])
@@ -191,21 +223,51 @@ class Controller:
 
         if self.qp_problem is None:
             self.qp_problem = osqp.OSQP()
+            self.H_first = H
             self.qp_problem.setup(H, g, C, c_low, c_high, warm_start=True, verbose=False)
-            #self.qp_problem.codegen("c_code", python_ext_name="osqp_c")
-            #import osqp_c
+            self.qp_problem.codegen("c_code", python_ext_name="osqp_c", parameters="matrices", force_rewrite=True)
+            import osqp_c
         else:
-            #osqp_c.update_P(H[H != 0], None)
-            self.qp_problem.update(Px=H, Ax=C, q=g, l=c_low, u=c_high)
+            import osqp_c
+            osqp_c.update_lin_cost(g)
+            osqp_c.update_bounds(c_low, c_high)
+            #print(H[H!=0])
+            #assert False
+            #osqp_c.update_P(H[H!=0], None, 0)
+            #osqp_c.update_A(C[C!=0], None, 0)
 
-        result = self.qp_problem.solve()
+            #self.qp_problem.update(q=g, l=c_low, u=c_high)
+            #self.qp_problem.update(Px=np.array(H))
+            #self.qp_problem.update(Ax=np.array(C))
 
-        if result.info.status != "solved":
+        #result = self.qp_problem.solve()
+        result = osqp_c.solve()
+        x, y, status_val, iters, run_time = result
+
+        if status_val > 1:
+            print("Status: ",status_val)
+            print("Iters: ",iters)
             raise ValueError("OSQP did not solve the problem!")
 
-        U = result.x
-        self.Uz_last = U[2::3]
+        U = x #[120,]
+        U = U.reshape(self.k, self.n, 3)
+        Uz = U.reshape(-1,3)
+        self.Uz_last = Uz[:,2]
         return U
+
+    def WBC_ground_force_control(self, grf):
+        pin.computeJointJacobians(self.robot, self.data, self.q)
+        T = []
+        for i in range(len(self.feet_links)):
+            frame_id = self.robot.getFrameId(self.feet_links[i])
+            Jacobian = pin.getFrameJacobian(self.robot, self.data, frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+            j = self.foot_jacobian_selector[i]
+            J = Jacobian[0:3,3*j:3*(j+1)]
+            T.append(J.T @ self.R.T @ grf[j,...])
+        return T
+
+    def set_feet_links(self, feet_links):
+        self.feet_links = feet_links
 
     def get_skew_sym_mat(self, v):
         assert v.size == 3
@@ -277,4 +339,4 @@ print(foot_pose)
 env = Env(True, "config.yaml")
 for i in range(1000):
     env.step()
-    time.sleep(1/1000.)
+    time.sleep(1/20.)

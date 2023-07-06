@@ -2,7 +2,6 @@ import datetime
 import numpy as np
 import os
 import osqp
-#import osqp_c
 import pinocchio as pin
 import pybullet as p
 import pybullet_data
@@ -128,6 +127,7 @@ class Controller:
         self.Uz_last = 100 * np.ones((self.n*self.k,))
         self.c = np.array([[1/self.mu,0,0],[0,1/self.mu,0],[0,0,1]])
         self.foot_jacobian_selector = [1, 0, 3, 2] #picks which submatrix of jacobian goes with each foot
+        self.GS = GaitScheduler()
 
     def update_kinematics(self, q, q_dot):
         self.q, self.q_dot = q, q_dot
@@ -145,7 +145,7 @@ class Controller:
             ori[2,0], pose[0,0], pose[1,0], pose[2,0],
             yaw_cmd, vx_cmd, vy_cmd
             )
-        t_stance = self.get_stance_time()
+        t_stance = self.GS.get_stance_time()
         r = self.get_footstep_pose(x, hips, t_stance) #desired footstep location
         self.R = self.rot(ori[2,0]).T
         A = np.block([
@@ -169,9 +169,6 @@ class Controller:
 
     def step_WBC(self, u):
         return self.WBC_ground_force_control(u)
-
-    def get_stance_time(self):
-        return np.array([[0.5,0.5,0.5,0.5]]).T
 
     def get_ref_com(self, yaw, x, y, z, yaw_rate_cmd, vx_cmd, vy_cmd):
         A = np.block([
@@ -317,6 +314,69 @@ class Controller:
         loc[:,2] = 0
         return loc
 
+class GaitScheduler:
+    def __init__(self, T=1, phi_offset=np.array([0, 0.25, 0.5, 0.75]), swing_ratio=0.5, dt=1/500.):
+        self.t0 = 0
+        self.t = 0
+        self.T = T
+        self.phi_offset = phi_offset #FR,FL,RR,RL
+        self.swing_ratio = swing_ratio
+        self.dt = dt
+
+    def phi(self):
+        return (self.t - self.t0) / self.T
+
+    def step(self):
+        self.t += self.dt
+        return (self.phi() + self.phi_offset)%1 > (1-self.swing_ratio) #true if phare is greater than 1-swing ratio
+
+    def reset(self):
+        self.t0 = 0
+        self.t = 0
+        return (self.phi() + self.phi_offset)%1 > (1-self.swing_ratio)
+
+    def get_stance_time(self):
+        return self.T * self.swing_ratio * np.ones((4,1))
+
+class SwingController:
+    def __init__(self):
+        pass
+
+    def get_parabola(self, phi, start, mid, end):
+        mid_phase = 0.5
+        d1 = mid - start
+        d2 = end - start
+        d3 = mid_phase**2 - mid_phase
+        a = (d1 - d2 * mid_phase) / d3
+        b = (d2 * mid_phase**2 - d1) / d3
+        c = start
+        return a * phi**2 + b * phase + c
+
+    def get_swing_trajectory(self, phi, start_pose, end_pose, foot_height):
+        if phi <= 0.5:
+            phase = 0.8 * np.sin(phi * np.pi)
+        else:
+            phase = 0.8 + (phi - 0.5) * 0.4
+
+        x = (1 - phase) * start_pose[0] + phase * end_pose[0]
+        y = (1 - phase) * start_pose[1] + phase * end_pose[1]
+        mid = max(start_pose[2], end_pose[2]) + foot_height
+        z = self.get_parabola(phase, start_pose[2], mid, end_pose[2])
+        return np.array([x, y, z])
+
+
+
+
+
+gs = GaitScheduler()
+gs.step()
+gs.step()
+gait = gs.step()
+gait2 = gs.reset()
+print(gait)
+print(gait2)
+print(gs.get_stance_time())
+assert False
 
 """
 yaw = 0

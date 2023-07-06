@@ -74,12 +74,13 @@ class Env:
         links = self.client.getLinkStates(self.robot, [self.hip_name2idx[hip_name] for hip_name in self.hips])
         hip_poses = np.array([l[0] for l in links])
         footstep = self.controller.get_footstep_pose(x, hip_poses, t_stance)
-        u = self.controller.step_MPC(x, hip_poses)
+        u = self.controller.step_MPC(x, hip_poses, yaw_cmd=0, vx_cmd=0, vy_cmd=0)
+        #print(u)
         for _ in range(self.cfg["PHYSICS_HZ"]//self.cfg["MPC_HZ"]):
             self.controller.update_kinematics(*self.get_q())
             torques = self.controller.step_WBC(u)
             torque = np.concatenate(torques)
-            print(torque)
+            #print(torque)
             self.client.setJointMotorControlArray(self.robot,
                 self.active_joint_idx, p.TORQUE_CONTROL,
                 forces=torque)
@@ -133,7 +134,7 @@ class Controller:
         pin.forwardKinematics(self.robot, self.data, q, q_dot)
         pin.updateFramePlacements(self.robot, self.data)
 
-    def step_MPC(self, x, hips, mpc_update=True, yaw_cmd=0, vx_cmd=0, vy_cmd=0):
+    def step_MPC(self, x, hips, yaw_cmd=0, vx_cmd=0, vy_cmd=0):
         x = x.reshape(-1,1)
         ori = x[:3]
         pose = x[3:6]
@@ -192,7 +193,7 @@ class Controller:
         return np.power(A, i)
 
 
-    def MPC(self, A, B, x0, x_ref):
+    def MPC(self, A, B, x0, x_ref, codegen=True):
         Aqp = np.block([
             [np.power(A, i)]
             for i in range(1, self.k+1)
@@ -208,6 +209,8 @@ class Controller:
 
         H = 2*(Bqp.T @ L @ Bqp + K)
         H = sp.sparse.csc_matrix(H)
+        LU = sp.sparse.linalg.splu(H)
+        HU = LU.U
         g = 2*Bqp.T @ L @ (Aqp @ x0 - x_ref)
 
         Uz_last_low = np.minimum(-self.Uz_last, 0)
@@ -225,32 +228,30 @@ class Controller:
             self.qp_problem = osqp.OSQP()
             self.H_first = H
             self.qp_problem.setup(H, g, C, c_low, c_high, warm_start=True, verbose=False)
-            self.qp_problem.codegen("c_code", python_ext_name="osqp_c", parameters="matrices", force_rewrite=True)
-            import osqp_c
-        else:
+            if codegen:
+                self.qp_problem.codegen("c_code", python_ext_name="osqp_c", parameters="matrices", force_rewrite=True)
+            
+        if codegen:
             import osqp_c
             osqp_c.update_lin_cost(g)
             osqp_c.update_bounds(c_low, c_high)
-            #print(H[H!=0])
-            #assert False
-            #osqp_c.update_P(H[H!=0], None, 0)
-            #osqp_c.update_A(C[C!=0], None, 0)
+            osqp_c.update_P_A(sp.sparse.triu(H).data, None, 0, C.data, None, 0)
 
-            #self.qp_problem.update(q=g, l=c_low, u=c_high)
-            #self.qp_problem.update(Px=np.array(H))
-            #self.qp_problem.update(Ax=np.array(C))
+            result = osqp_c.solve()
+            x, y, status_val, iters, run_time = result
+            if status_val != 1:
+                raise ValueError("OSQP did not solve the problem!")
 
-        #result = self.qp_problem.solve()
-        result = osqp_c.solve()
-        x, y, status_val, iters, run_time = result
+        else:
+            self.qp_problem.update(q=g, l=c_low, u=c_high)
+            self.qp_problem.update(Px=sp.sparse.triu(H).data, Ax=C.data)
 
-        if status_val > 1:
-            print("Status: ",status_val)
-            print("Iters: ",iters)
-            raise ValueError("OSQP did not solve the problem!")
+            result = self.qp_problem.solve()
+            if result.info.status != "solved":
+                raise ValueError("OSQP did not solve the problem!")
+            x = result.x
 
-        U = x #[120,]
-        U = U.reshape(self.k, self.n, 3)
+        U = x.reshape(self.k, self.n, 3) #[120,] -> [10,4,3]
         Uz = U.reshape(-1,3)
         self.Uz_last = Uz[:,2]
         return U

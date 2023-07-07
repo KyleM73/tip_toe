@@ -41,7 +41,7 @@ class Env:
         self.ground = self.client.loadURDF("plane.urdf")
 
         ## setup robot
-        self.robot = self.client.loadURDF(self.cfg["ROBOT_URDF"], [0, 0, 0.5], [0, 0, 0, 1], useFixedBase=False)
+        self.robot = self.client.loadURDF(self.cfg["ROBOT_URDF"], [0, 0, 0.44], [0, 0, 0, 1], useFixedBase=True)
 
         ## let robot settle
         for _ in range(self.cfg["PHYSICS_HZ"]):
@@ -59,7 +59,8 @@ class Env:
             self.active_joint_name2idx[jointInfo[1].decode('UTF-8')] = jointInfo[0]
         self.hip_name2idx = {k:v for k,v in self.link_name2idx.items() if k[-3:] == "hip"}
         self.hips = [k for k in self.hip_name2idx.keys()]
-        self.feet = [k for k in self.link_name2idx.keys() if "foot" in k]
+        self.feet_name2idx = {k:v for k,v in self.link_name2idx.items() if "foot" in k}
+        self.feet = [k for k in self.feet_name2idx.keys()]
         self.active_joint_idx = [v for v in self.active_joint_name2idx.values()]
 
         ## initialize controller
@@ -67,22 +68,23 @@ class Env:
         self.controller.update_kinematics(*self.get_q())
         self.controller.set_feet_links(self.feet)
 
-    def step(self):
+    def step(self, yaw_cmd=0, vx_cmd=0, vy_cmd=0):
         x = self.get_obs()
-        t_stance = np.array([[0.5,0.5,0.5,0.5]]).T
-        links = self.client.getLinkStates(self.robot, [self.hip_name2idx[hip_name] for hip_name in self.hips])
-        hip_poses = np.array([l[0] for l in links])
-        footstep = self.controller.get_footstep_pose(x, hip_poses, t_stance)
-        u = self.controller.step_MPC(x, hip_poses, yaw_cmd=0, vx_cmd=0, vy_cmd=0)
-        #print(u)
+        hip_links = self.client.getLinkStates(self.robot, [self.hip_name2idx[hip_name] for hip_name in self.hips])
+        hip_poses = np.array([l[0] for l in hip_links])
+        u = self.controller.step_MPC(x, hip_poses, yaw_cmd, vx_cmd, vy_cmd)
+        print()
+        print(u)
+        feet_links = self.client.getLinkStates(self.robot, [self.feet_name2idx[foot_name] for foot_name in self.feet])
+        feet_poses = np.array([l[0] for l in feet_links])
         for _ in range(self.cfg["PHYSICS_HZ"]//self.cfg["MPC_HZ"]):
             self.controller.update_kinematics(*self.get_q())
-            torques = self.controller.step_WBC(u)
-            torque = np.concatenate(torques)
-            #print(torque)
+            feet_links_wbc = self.client.getLinkStates(self.robot, [self.feet_name2idx[foot_name] for foot_name in self.feet], 1) #computeVelocity
+            feet_vel = np.array([l[6] for l in feet_links_wbc])
+            torques = self.controller.step_WBC(u, feet_poses, feet_vel)
             self.client.setJointMotorControlArray(self.robot,
                 self.active_joint_idx, p.TORQUE_CONTROL,
-                forces=torque)
+                forces=torques)
             self.client.stepSimulation()
 
     def get_obs(self):
@@ -127,7 +129,12 @@ class Controller:
         self.Uz_last = 100 * np.ones((self.n*self.k,))
         self.c = np.array([[1/self.mu,0,0],[0,1/self.mu,0],[0,0,1]])
         self.foot_jacobian_selector = [1, 0, 3, 2] #picks which submatrix of jacobian goes with each foot
-        self.GS = GaitScheduler()
+        self.GS = GaitScheduler(dt=self.delta_t)
+        self.contact_pattern = self.GS.reset()
+        self.t_stance = self.GS.get_stance_time()
+        self.SwingController = SwingController()
+        self.Kp = np.diag([1,1,1])
+        self.Kd = np.diag([1,1,1])
 
     def update_kinematics(self, q, q_dot):
         self.q, self.q_dot = q, q_dot
@@ -145,8 +152,7 @@ class Controller:
             ori[2,0], pose[0,0], pose[1,0], pose[2,0],
             yaw_cmd, vx_cmd, vy_cmd
             )
-        t_stance = self.GS.get_stance_time()
-        r = self.get_footstep_pose(x, hips, t_stance) #desired footstep location
+        self.r = self.get_footstep_pose(x, hips) #desired footstep location
         self.R = self.rot(ori[2,0]).T
         A = np.block([
             [np.eye(3), np.zeros((3,3)), self.R*self.delta_t, np.zeros((3,3)), np.zeros((3,1))],
@@ -157,18 +163,40 @@ class Controller:
             ])
         gI_inv = np.linalg.inv(self.R@self.body_inertia@self.R.T)
         B = np.block([
-            [np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3))],
-            [np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3)), np.zeros((3,3))],
-            [gI_inv@self.get_skew_sym_mat(r[i])*self.delta_t for i in range(self.n)],
+            [np.zeros((3,3)) for _ in range(self.n)],
+            [np.zeros((3,3)) for _ in range(self.n)],
+            [gI_inv@self.get_skew_sym_mat(self.r[i])*self.delta_t for i in range(self.n)], #if self.contact_pattern[i] else np.zeros((3,3)) 
             [np.eye(3)*self.delta_t/self.m for _ in range(self.n)],
             [np.zeros((1,3)) for _ in range(self.n)]
             ])
         U = self.MPC(A, B, x, x_ref)
-        u = U[0,...]
+        #u = np.zeros((self.n, 3))
+        #for i in range(self.n):
+        #    if self.contact_pattern[i]:
+        #        u[i, ...] = U[0, i]
+        u = U[0, ...]
         return u
 
-    def step_WBC(self, u):
-        return self.WBC_ground_force_control(u)
+    def step_WBC(self, grf, feet_pose, feet_vel):
+        self.contact_pattern = self.GS.step()
+        pin.computeJointJacobians(self.robot, self.data, self.q)
+        J = self.get_foot_jacobians()
+        T = []
+        for i in range(self.n):
+            if self.contact_pattern[i]:
+                T.append(J[i].T @ self.R.T @ grf[self.foot_jacobian_selector[i],...])
+                #print(T[-1].shape)
+            else:
+                phi = self.GS.get_phis()[i]
+                G_pose = self.SwingController.get_swing_trajectory(phi, feet_pose[i], self.r[i])
+                B_pose = self.R.T @ G_pose
+                pose_err = B_pose - self.R.T @ feet_pose[i].reshape(3,1)
+                B_vel = (B_pose - self.R.T @ self.SwingController.get_swing_trajectory(self.GS.last_phis[i], feet_pose[i], self.r[i])) / self.delta_t
+                vel_err = B_vel - self.R.T @ feet_vel[i].reshape(3,1)
+                Tau_ff = 0
+                Tau = J[i].T @ (self.Kp @ pose_err + self.Kd @ vel_err) + Tau_ff
+                T.append(Tau.reshape(-1))
+        return np.concatenate(T)
 
     def get_ref_com(self, yaw, x, y, z, yaw_rate_cmd, vx_cmd, vy_cmd):
         A = np.block([
@@ -188,7 +216,6 @@ class Controller:
         elif i == 0:
             return np.eye(A.shape[-1])
         return np.power(A, i)
-
 
     def MPC(self, A, B, x0, x_ref, codegen=True):
         Aqp = np.block([
@@ -210,12 +237,13 @@ class Controller:
         HU = LU.U
         g = 2*Bqp.T @ L @ (Aqp @ x0 - x_ref)
 
+        #Uz_curr = (self.contact_pattern.reshape(-1,1) * self.Uz_last.reshape((self.n,self.k))).reshape((-1))
         Uz_last_low = np.minimum(-self.Uz_last, 0)
-        c_l = [np.array([Uz_last_low[i], Uz_last_low[i], self.fmin]) for i in range(self.n*self.k)]
+        c_l = [np.array([Uz_last_low[i], Uz_last_low[i], self.fmin*self.contact_pattern[i%self.n]]) for i in range(self.n*self.k)]
         c_low = np.block(c_l).reshape(-1, 1)
         
         Uz_last_high = np.maximum(self.Uz_last, 0)
-        c_h = [np.array([Uz_last_high[i], Uz_last_high[i], self.fmax]) for i in range(self.n*self.k)]
+        c_h = [np.array([Uz_last_high[i], Uz_last_high[i], self.fmax*self.contact_pattern[i%self.n]]) for i in range(self.n*self.k)]
         c_high = np.block(c_h).reshape(-1, 1)
 
         C = sp.linalg.block_diag(*[self.c for _ in range(self.n*self.k)])
@@ -237,6 +265,9 @@ class Controller:
             result = osqp_c.solve()
             x, y, status_val, iters, run_time = result
             if status_val != 1:
+                print("status: {}".format(status_val))
+                print("iters: {}".format(iters))
+                print("run_time: {} ".format(run_time))
                 raise ValueError("OSQP did not solve the problem!")
 
         else:
@@ -256,13 +287,21 @@ class Controller:
     def WBC_ground_force_control(self, grf):
         pin.computeJointJacobians(self.robot, self.data, self.q)
         T = []
+        J = self.get_foot_jacobians()
+        for i in range(len(self.feet_links)):
+            T.append(J[i].T @ self.R.T @ grf[self.foot_jacobian_selector[i],...])
+        return np.concatenate(T)
+
+    def get_foot_jacobians(self):
+        J = []
         for i in range(len(self.feet_links)):
             frame_id = self.robot.getFrameId(self.feet_links[i])
             Jacobian = pin.getFrameJacobian(self.robot, self.data, frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
             j = self.foot_jacobian_selector[i]
-            J = Jacobian[0:3,3*j:3*(j+1)]
-            T.append(J.T @ self.R.T @ grf[j,...])
-        return T
+            J.append(Jacobian[0:3,3*j:3*(j+1)])
+        return J
+
+
 
     def set_feet_links(self, feet_links):
         self.feet_links = feet_links
@@ -283,7 +322,7 @@ class Controller:
             [0, 0, 1]
             ])
 
-    def get_footstep_pose(self, x, hips, t_stance):
+    def get_footstep_pose(self, x, hips):
         # returns (4,3) array of footstep locations
         x = x.reshape(-1,1)
         ori = x[:3]
@@ -293,11 +332,11 @@ class Controller:
         g = x[12]
 
         p_ref = pose + self.rot(ori[2,0]) @ hips.T
-        p_des = p_ref.T + vel.T*t_stance/2
+        p_des = p_ref.T + vel.T*self.t_stance/2
         p_des[:,2] = 0
         return p_des
 
-    def get_footstep_pose_WBIC(self, v_cmd, w_cmd, x, hips, t_stance, k=0.03):
+    def get_footstep_pose_WBIC(self, v_cmd, w_cmd, x, hips, k=0.03):
         # returns (4,3) array of footstep locations
         x = x.reshape(-1,1)
         ori = x[:3]
@@ -307,7 +346,7 @@ class Controller:
         g = x[12]
 
         p_hip = pose + self.rot(ori[2,0]) @ hips.T
-        p_sym = vel.T*t_stance/2 + k*(vel.T - v_cmd)
+        p_sym = vel.T*self.t_stance/2 + k*(vel.T - v_cmd)
         p_centrifugal = np.sqrt(np.abs(pose[2]/g))/2 * np.cross(vel.T,w_cmd)
 
         loc = p_hip.T + p_sym + p_centrifugal
@@ -315,25 +354,34 @@ class Controller:
         return loc
 
 class GaitScheduler:
-    def __init__(self, T=1, phi_offset=np.array([0, 0.25, 0.5, 0.75]), swing_ratio=0.5, dt=1/500.):
+    def __init__(self, T=1, phi_offset=np.array([0, 0.25, 0.5, 0.75]), swing_ratio=0.5, dt=1/100.):
         self.t0 = 0
         self.t = 0
         self.T = T
         self.phi_offset = phi_offset #FR,FL,RR,RL
         self.swing_ratio = swing_ratio
         self.dt = dt
+        self.contact = (self.phi() + self.phi_offset)%1 < (1-self.swing_ratio) #true if phare is greater than 1-swing ratio
+        self.last_phis = self.phi() + self.phi_offset
 
     def phi(self):
         return (self.t - self.t0) / self.T
 
+    def get_phis(self):
+        return self.phi() + self.phi_offset
+
     def step(self):
+        self.last_phis = self.phi() + self.phi_offset
         self.t += self.dt
-        return (self.phi() + self.phi_offset)%1 > (1-self.swing_ratio) #true if phare is greater than 1-swing ratio
+        self.contact = (self.phi() + self.phi_offset)%1 < (1-self.swing_ratio)
+        return self.contact
 
     def reset(self):
         self.t0 = 0
         self.t = 0
-        return (self.phi() + self.phi_offset)%1 > (1-self.swing_ratio)
+        self.contact = (self.phi() + self.phi_offset)%1 < (1-self.swing_ratio)
+        self.last_phis = self.phi() + self.phi_offset
+        return self.contact
 
     def get_stance_time(self):
         return self.T * self.swing_ratio * np.ones((4,1))
@@ -350,9 +398,9 @@ class SwingController:
         a = (d1 - d2 * mid_phase) / d3
         b = (d2 * mid_phase**2 - d1) / d3
         c = start
-        return a * phi**2 + b * phase + c
+        return a * phi**2 + b * phi + c
 
-    def get_swing_trajectory(self, phi, start_pose, end_pose, foot_height):
+    def get_swing_trajectory(self, phi, start_pose, end_pose, foot_height=0.3):
         if phi <= 0.5:
             phase = 0.8 * np.sin(phi * np.pi)
         else:
@@ -362,40 +410,10 @@ class SwingController:
         y = (1 - phase) * start_pose[1] + phase * end_pose[1]
         mid = max(start_pose[2], end_pose[2]) + foot_height
         z = self.get_parabola(phase, start_pose[2], mid, end_pose[2])
-        return np.array([x, y, z])
+        return np.array([x, y, z]).reshape(3,1)
 
-
-
-
-
-gs = GaitScheduler()
-gs.step()
-gs.step()
-gait = gs.step()
-gait2 = gs.reset()
-print(gait)
-print(gait2)
-print(gs.get_stance_time())
-assert False
-
-"""
-yaw = 0
-x,y,z = 1,0.5,0.5
-yaw_cmd = 0.1
-vx_cmd,vy_cmd = 1,0
-
-traj = get_ref_com(yaw,x,y,z,yaw_cmd,vx_cmd,vy_cmd,1,1)
-x0 = traj[:13]
-
-
-v_cmd = np.array([[vx_cmd,vy_cmd,0]])
-w_cmd = np.array([[0,0,yaw_cmd]])
-shoulder = x0[3:6].T + np.array([[0.25,0.25,0],[0.25,-0.25,0],[-0.25,0.25,0],[-0.25,-0.25,0]])
-t_stance = 0.1
-
-foot_pose = get_footstep_pose(v_cmd,w_cmd,x0,shoulder,t_stance)
-print(foot_pose)
-"""
+    def get_swing_velocity(self, pose, last_pose, dt):
+        return (pose - last_pose) / dt
 
 env = Env(True, "config.yaml")
 for i in range(1000):

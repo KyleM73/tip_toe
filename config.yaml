@@ -1,4 +1,4 @@
 SEED: 0
 PHYSICS_HZ: 1000
-MPC_HZ: 20
+MPC_HZ: 100
 ROBOT_URDF: "robots/go1.urdf"

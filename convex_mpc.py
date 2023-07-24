@@ -67,14 +67,28 @@ class Env:
         self.controller = Controller(self.cfg["ROBOT_URDF"])
         self.controller.update_kinematics(*self.get_q())
         self.controller.set_feet_links(self.feet)
+        
+        ## initialize debug lines
+        feet_links = self.client.getLinkStates(self.robot, [self.feet_name2idx[foot_name] for foot_name in self.feet])
+        feet_poses = [l[0] for l in feet_links]
+        self.FR = self.client.addUserDebugLine(feet_poses[0], [0, 0, 1], [1, 0, 0], 3)
+        self.FL = self.client.addUserDebugLine(feet_poses[1], [0, 0, 1], [0, 0, 1], 3)
+        self.RR = self.client.addUserDebugLine(feet_poses[2], [0, 0, 1], [1, 0, 0], 3)
+        self.RL = self.client.addUserDebugLine(feet_poses[3], [0, 0, 1], [0, 0, 1], 3)
 
     def step(self, yaw_cmd=0, vx_cmd=0, vy_cmd=0):
         x = self.get_obs()
         hip_links = self.client.getLinkStates(self.robot, [self.hip_name2idx[hip_name] for hip_name in self.hips])
         hip_poses = np.array([l[0] for l in hip_links])
         u = self.controller.step_MPC(x, hip_poses, yaw_cmd, vx_cmd, vy_cmd)
-        print()
-        print(u)
+        foot_poses = self.controller.get_footstep_pose(x, hip_poses)
+        self.FR = self.client.addUserDebugLine(foot_poses[0,:], u[0,:]/np.linalg.norm(u[0,:]), [1, 0, 0], 3, replaceItemUniqueId=self.FR)
+        self.FL = self.client.addUserDebugLine(foot_poses[1,:], u[1,:]/np.linalg.norm(u[1,:]), [0, 0, 1], 3, replaceItemUniqueId=self.FL)
+        self.RR = self.client.addUserDebugLine(foot_poses[2,:], u[2,:]/np.linalg.norm(u[2,:]), [1, 0, 0], 3, replaceItemUniqueId=self.RR)
+        self.RL = self.client.addUserDebugLine(foot_poses[3,:], u[3,:]/np.linalg.norm(u[3,:]), [0, 0, 1], 3, replaceItemUniqueId=self.RL)
+        #print()
+        #print(u[:,2])
+        #print(self.controller.contact_pattern)
         feet_links = self.client.getLinkStates(self.robot, [self.feet_name2idx[foot_name] for foot_name in self.feet])
         feet_poses = np.array([l[0] for l in feet_links])
         for _ in range(self.cfg["PHYSICS_HZ"]//self.cfg["MPC_HZ"]):
@@ -97,15 +111,21 @@ class Env:
         return np.array(x).reshape(-1,1)
 
     def get_q(self):
+        x = self.get_obs()
+        oriq = list(self.client.getQuaternionFromEuler(x[0:3]))
+        pose = x[3:6].T.tolist()[0]
+        avel = x[6:9].T.tolist()[0]
+        vel = x[9:12].T.tolist()[0]
         configuration = self.client.getJointStates(self.robot, self.active_joint_idx)
-        q = [c[0] for c in configuration]
-        q_dot = [c[1] for c in configuration]
+        q = pose + oriq + [c[0] for c in configuration]
+        q_dot = vel + avel + [c[1] for c in configuration]
         return np.array(q), np.array(q_dot)
 
 class Controller:
     def __init__(self, robot_urdf):
-        self.robot = pin.buildModelFromUrdf(robot_urdf)
+        self.robot = pin.buildModelFromUrdf(robot_urdf, pin.JointModelFreeFlyer())
         self.data = self.robot.createData()
+        # if floating base : self.robot.nq = 19; self.robot.nv = 18 --> floating coords first in vec
         #for name, function in self.robot.__class__.__dict__.items():
         #    print(' **** %s: %s' % (name, function.__doc__))
         self.n = 4
@@ -113,7 +133,7 @@ class Controller:
         self.dt = 0.5
         self.k = 10
         self.delta_t = self.dt/self.k
-        self.m = 12
+        self.m = sum([inertia.mass for inertia in self.robot.inertias]) #13.1 <-> 12
         self.mu = 0.6
         self.body_inertia = np.array([
             [0.13,0,0],
@@ -133,7 +153,7 @@ class Controller:
         self.contact_pattern = self.GS.reset()
         self.t_stance = self.GS.get_stance_time()
         self.SwingController = SwingController()
-        self.Kp = np.diag([1,1,1])
+        self.Kp = 5*np.diag([1,1,1])
         self.Kd = np.diag([1,1,1])
 
     def update_kinematics(self, q, q_dot):
@@ -178,6 +198,7 @@ class Controller:
         return u
 
     def step_WBC(self, grf, feet_pose, feet_vel):
+        #print(self.contact_pattern)
         self.contact_pattern = self.GS.step()
         pin.computeJointJacobians(self.robot, self.data, self.q)
         J = self.get_foot_jacobians()
@@ -301,8 +322,6 @@ class Controller:
             J.append(Jacobian[0:3,3*j:3*(j+1)])
         return J
 
-
-
     def set_feet_links(self, feet_links):
         self.feet_links = feet_links
 
@@ -400,7 +419,7 @@ class SwingController:
         c = start
         return a * phi**2 + b * phi + c
 
-    def get_swing_trajectory(self, phi, start_pose, end_pose, foot_height=0.3):
+    def get_swing_trajectory(self, phi, start_pose, end_pose, foot_height=0.05):
         if phi <= 0.5:
             phase = 0.8 * np.sin(phi * np.pi)
         else:

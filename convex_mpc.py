@@ -81,14 +81,17 @@ class Env:
         hip_links = self.client.getLinkStates(self.robot, [self.hip_name2idx[hip_name] for hip_name in self.hips])
         hip_poses = np.array([l[0] for l in hip_links])
         u = self.controller.step_MPC(x, hip_poses, yaw_cmd, vx_cmd, vy_cmd)
+        
+        ##debug
         foot_poses = self.controller.get_footstep_pose(x, hip_poses)
-        self.FR = self.client.addUserDebugLine(foot_poses[0,:], u[0,:]/np.linalg.norm(u[0,:]), [1, 0, 0], 3, replaceItemUniqueId=self.FR)
-        self.FL = self.client.addUserDebugLine(foot_poses[1,:], u[1,:]/np.linalg.norm(u[1,:]), [0, 0, 1], 3, replaceItemUniqueId=self.FL)
-        self.RR = self.client.addUserDebugLine(foot_poses[2,:], u[2,:]/np.linalg.norm(u[2,:]), [1, 0, 0], 3, replaceItemUniqueId=self.RR)
-        self.RL = self.client.addUserDebugLine(foot_poses[3,:], u[3,:]/np.linalg.norm(u[3,:]), [0, 0, 1], 3, replaceItemUniqueId=self.RL)
+        self.FR = self.client.addUserDebugLine(foot_poses[0,:], foot_poses[0,:]+u[0,:]/np.linalg.norm(u[0,:]), [1, 0, 0], 3, replaceItemUniqueId=self.FR)
+        self.FL = self.client.addUserDebugLine(foot_poses[1,:], foot_poses[1,:]+u[1,:]/np.linalg.norm(u[1,:]), [0, 0, 1], 3, replaceItemUniqueId=self.FL)
+        self.RR = self.client.addUserDebugLine(foot_poses[2,:], foot_poses[2,:]+u[2,:]/np.linalg.norm(u[2,:]), [1, 0, 0], 3, replaceItemUniqueId=self.RR)
+        self.RL = self.client.addUserDebugLine(foot_poses[3,:], foot_poses[3,:]+u[3,:]/np.linalg.norm(u[3,:]), [0, 0, 1], 3, replaceItemUniqueId=self.RL)
         #print()
         #print(u[:,2])
         #print(self.controller.contact_pattern)
+        
         feet_links = self.client.getLinkStates(self.robot, [self.feet_name2idx[foot_name] for foot_name in self.feet])
         feet_poses = np.array([l[0] for l in feet_links])
         for _ in range(self.cfg["PHYSICS_HZ"]//self.cfg["MPC_HZ"]):
@@ -96,6 +99,9 @@ class Env:
             feet_links_wbc = self.client.getLinkStates(self.robot, [self.feet_name2idx[foot_name] for foot_name in self.feet], 1) #computeVelocity
             feet_vel = np.array([l[6] for l in feet_links_wbc])
             torques = self.controller.step_WBC(u, feet_poses, feet_vel)
+            #print(torques)
+            #print()
+            #time.sleep(0.01)
             self.client.setJointMotorControlArray(self.robot,
                 self.active_joint_idx, p.TORQUE_CONTROL,
                 forces=torques)
